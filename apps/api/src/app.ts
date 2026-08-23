@@ -27,7 +27,6 @@ const generationRequestSchema = z.object({
   prompt: z.string().trim().min(3).max(500),
   context: z
     .object({
-      serviceId: z.string().min(1),
       tables: z.array(z.string()).optional(),
       metrics: z.array(z.string()).optional(),
       savedQuery: z.string().optional(),
@@ -46,8 +45,10 @@ interface QueryJob {
   events: QueryEvent[];
   subscribers: Set<(event: QueryEvent) => void>;
   timers: NodeJS.Timeout[];
+  evictionTimer?: NodeJS.Timeout;
 }
 
+const JOB_TTL_MS = 5 * 60_000;
 const jobs = new Map<string, QueryJob>();
 const history: QueryHistoryItem[] = [];
 
@@ -61,6 +62,22 @@ function getSchema(serviceId: string): SchemaTable[] {
 
 function getMetrics(serviceId: string): MetricDefinition[] {
   return metrics[serviceId] ?? [];
+}
+
+function getSelectedTables(serviceId: string, requestedTables?: string[]): SchemaTable[] {
+  const availableTables = getSchema(serviceId);
+  if (!requestedTables?.length) return availableTables;
+
+  const requested = new Set(requestedTables);
+  return availableTables.filter((table) => requested.has(`${table.database}.${table.name}`) || requested.has(table.name));
+}
+
+function getSelectedMetrics(serviceId: string, requestedMetrics?: string[]): MetricDefinition[] {
+  const availableMetrics = getMetrics(serviceId);
+  if (!requestedMetrics?.length) return availableMetrics;
+
+  const requested = new Set(requestedMetrics);
+  return availableMetrics.filter((metric) => requested.has(metric.name));
 }
 
 function addHistory(run: QueryRun, resultSummary?: string): void {
@@ -101,9 +118,9 @@ function validateQuery(mode: QueryMode, query: string): string[] {
   return errors;
 }
 
-function buildSqlDraft(prompt: string, serviceId: string): QueryDraft {
+function buildSqlDraft(prompt: string, serviceId: string, requestedTables?: string[]): QueryDraft {
   const normalized = prompt.toLowerCase();
-  const tables = getSchema(serviceId);
+  const tables = getSelectedTables(serviceId, requestedTables);
   const hasErrorsTable = tables.some((table) => table.name === "errors");
   const hasOrdersTable = tables.some((table) => table.name === "orders");
 
@@ -139,9 +156,9 @@ function buildSqlDraft(prompt: string, serviceId: string): QueryDraft {
   };
 }
 
-function buildPromqlDraft(prompt: string, serviceId: string): QueryDraft {
+function buildPromqlDraft(prompt: string, serviceId: string, requestedMetrics?: string[]): QueryDraft {
   const normalized = prompt.toLowerCase();
-  const availableMetrics = getMetrics(serviceId);
+  const availableMetrics = getSelectedMetrics(serviceId, requestedMetrics);
   const metricNames = new Set(availableMetrics.map((metric) => metric.name));
 
   if (/latency|slow|p95|duration/.test(normalized) && metricNames.has("http_request_duration_seconds")) {
@@ -178,11 +195,11 @@ function buildPromqlDraft(prompt: string, serviceId: string): QueryDraft {
 
 function generateDraft(request: GenerationRequest): QueryDraft {
   return request.mode === "sql"
-    ? buildSqlDraft(request.prompt, request.serviceId)
-    : buildPromqlDraft(request.prompt, request.serviceId);
+    ? buildSqlDraft(request.prompt, request.serviceId, request.context?.tables)
+    : buildPromqlDraft(request.prompt, request.serviceId, request.context?.metrics);
 }
 
-function buildSqlResult(): SqlResult {
+function buildRequestResult(): SqlResult {
   return {
     mode: "sql",
     columns: ["service", "route", "requests", "average_duration_ms"],
@@ -195,16 +212,64 @@ function buildSqlResult(): SqlResult {
   };
 }
 
-function buildPromqlResult(): PromqlResult {
+function buildErrorsResult(): SqlResult {
+  return {
+    mode: "sql",
+    columns: ["service", "error_type", "errors"],
+    rows: [
+      { service: "checkout-api", error_type: "payment_timeout", errors: 184 },
+      { service: "identity-api", error_type: "invalid_session", errors: 96 },
+      { service: "catalog-api", error_type: "upstream_timeout", errors: 61 },
+    ],
+  };
+}
+
+function buildRevenueResult(): SqlResult {
+  return {
+    mode: "sql",
+    columns: ["region", "revenue"],
+    rows: [
+      { region: "DACH", revenue: 184_210.4 },
+      { region: "Nordics", revenue: 133_904.8 },
+      { region: "Benelux", revenue: 98_311.2 },
+    ],
+  };
+}
+
+function buildSqlResult(query: string): SqlResult {
+  const normalized = query.toLowerCase();
+  if (normalized.includes("analytics.errors") || /\berror_type\b/.test(normalized)) return buildErrorsResult();
+  if (normalized.includes("commerce.orders") || /\brevenue\b/.test(normalized)) return buildRevenueResult();
+  return buildRequestResult();
+}
+
+function buildPromqlResult(query: string): PromqlResult {
   const now = Math.floor(Date.now() / 300_000) * 300;
+  const normalized = query.toLowerCase();
+  const isLatency = normalized.includes("histogram_quantile") || normalized.includes("duration_seconds_bucket");
+  const isErrors = normalized.includes("http_request_errors_total");
+  const metric = isLatency ? "http_request_duration_seconds" : isErrors ? "http_request_errors_total" : "http_requests_total";
+  const unit = isLatency ? "seconds" : "per_second";
   const servicesToPlot = [
-    { name: "checkout-api", base: 0.028, slope: 0.0018 },
-    { name: "catalog-api", base: 0.012, slope: 0.0009 },
-    { name: "identity-api", base: 0.007, slope: -0.0004 },
+    {
+      name: "checkout-api",
+      base: isLatency ? 0.19 : isErrors ? 0.028 : 14,
+      slope: isLatency ? 0.004 : isErrors ? 0.0018 : 0.45,
+    },
+    {
+      name: "catalog-api",
+      base: isLatency ? 0.11 : isErrors ? 0.012 : 9,
+      slope: isLatency ? 0.002 : isErrors ? 0.0009 : 0.22,
+    },
+    {
+      name: "identity-api",
+      base: isLatency ? 0.08 : isErrors ? 0.007 : 6,
+      slope: isLatency ? -0.001 : isErrors ? -0.0004 : -0.12,
+    },
   ];
 
   const series: TimeSeries[] = servicesToPlot.map(({ name, base, slope }) => ({
-    metric: "http_request_errors_total",
+    metric,
     labels: { service: name },
     points: Array.from({ length: 18 }, (_, index) => ({
       timestamp: now - (17 - index) * 300,
@@ -212,30 +277,66 @@ function buildPromqlResult(): PromqlResult {
     })),
   }));
 
-  return { mode: "promql", series };
+  return { mode: "promql", unit, series };
 }
 
-function buildResult(mode: QueryMode): QueryResult {
-  return mode === "sql" ? buildSqlResult() : buildPromqlResult();
+export function buildResult(mode: QueryMode, query: string): QueryResult {
+  return mode === "sql" ? buildSqlResult(query) : buildPromqlResult(query);
 }
 
 function emit(job: QueryJob, event: QueryEvent): void {
   job.events.push(event);
   for (const subscriber of job.subscribers) {
-    subscriber(event);
+    try {
+      subscriber(event);
+    } catch {
+      job.subscribers.delete(subscriber);
+    }
   }
 }
 
-function setRunState(job: QueryJob, state: QueryRunState, message: string): void {
+function isTerminal(state: QueryRunState): boolean {
+  return state === "success" || state === "error" || state === "cancelled";
+}
+
+function transitionJob(job: QueryJob, state: QueryRunState, message: string): void {
   job.run = {
     ...job.run,
     state,
     ...(state === "running" ? { startedAt: new Date().toISOString() } : {}),
-    ...(state === "success" || state === "error" || state === "cancelled"
-      ? { finishedAt: new Date().toISOString(), durationMs: Date.now() - Date.parse(job.run.startedAt) }
-      : {}),
   };
   emit(job, { type: "status", run: job.run, message });
+}
+
+function scheduleEviction(job: QueryJob): void {
+  const timer = setTimeout(() => {
+    if (jobs.get(job.run.id) === job) jobs.delete(job.run.id);
+  }, JOB_TTL_MS);
+  timer.unref();
+  job.evictionTimer = timer;
+}
+
+function finishJob(job: QueryJob, state: "success" | "error" | "cancelled", message: string, resultSummary: string, error?: string): void {
+  if (isTerminal(job.run.state)) return;
+
+  for (const timer of job.timers) clearTimeout(timer);
+  job.timers = [];
+
+  const finishedAt = new Date().toISOString();
+  job.run = {
+    ...job.run,
+    state,
+    finishedAt,
+    durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(job.run.startedAt)),
+    ...(error ? { error } : {}),
+  };
+  emit(job, { type: "status", run: job.run, message });
+  if (state === "error" && error) {
+    emit(job, { type: "execution-error", run: job.run, message: error });
+  }
+  emit(job, { type: "complete", run: job.run });
+  addHistory(job.run, resultSummary);
+  scheduleEviction(job);
 }
 
 function startJob(job: QueryJob): void {
@@ -244,7 +345,7 @@ function startJob(job: QueryJob): void {
   job.timers.push(
     setTimeout(() => {
       if (job.run.state !== "queued") return;
-      setRunState(job, "running", "Query is running");
+      transitionJob(job, "running", "Query is running");
     }, 160),
   );
 
@@ -254,29 +355,20 @@ function startJob(job: QueryJob): void {
 
       if (/\bfail\b|\bsyntax_error\b/i.test(job.run.query)) {
         const errorMessage = "The query engine rejected this expression.";
-        job.run = { ...job.run, state: "error", error: errorMessage };
-        const errorEvent: QueryEvent = { type: "error", run: job.run, message: errorMessage };
-        emit(job, errorEvent);
-        addHistory(job.run, "Query failed");
+        finishJob(job, "error", "Query failed", "Query failed", errorMessage);
         return;
       }
 
-      const result = buildResult(job.run.mode);
+      const result = buildResult(job.run.mode, job.run.query);
       emit(job, { type: "data", result });
-      setRunState(job, "success", "Query completed");
-      emit(job, { type: "complete", run: job.run });
-      addHistory(job.run, job.run.mode === "sql" ? "4 rows" : "3 time-series" );
+      finishJob(job, "success", "Query completed", job.run.mode === "sql" ? "Rows returned" : "Series returned");
     },
   1_050),
   );
 }
 
 function cancelJob(job: QueryJob): void {
-  if (["success", "error", "cancelled"].includes(job.run.state)) return;
-  for (const timer of job.timers) clearTimeout(timer);
-  setRunState(job, "cancelled", "Query cancelled");
-  emit(job, { type: "complete", run: job.run });
-  addHistory(job.run, "Cancelled by user");
+  finishJob(job, "cancelled", "Query cancelled", "Cancelled by user");
 }
 
 function sendSse(reply: FastifyReply, event: QueryEvent): void {
@@ -290,6 +382,7 @@ export function buildApp(): FastifyInstance {
   app.addHook("onClose", async () => {
     for (const job of jobs.values()) {
       for (const timer of job.timers) clearTimeout(timer);
+      if (job.evictionTimer) clearTimeout(job.evictionTimer);
       job.subscribers.clear();
     }
     jobs.clear();

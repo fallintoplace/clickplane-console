@@ -89,6 +89,7 @@ button { cursor: pointer; }
 .secondary-button:hover, .toolbar-button:hover { border-color: #4a4d4d; color: var(--text); }
 .primary-button, .run-button { padding: 8px 11px; border: 1px solid #bd7910; color: #1a1308; background: var(--accent); }
 .primary-button:hover, .run-button:hover, .generate-button:hover { filter: brightness(1.08); }
+.run-button:disabled, .generate-button:disabled { cursor: not-allowed; filter: none; opacity: .45; }
 .primary-button.compact { padding-inline: 10px; }
 .mode-tabs { gap: 4px; border-bottom: 1px solid var(--line); }
 .mode-tabs button { padding: 10px 13px; border: 0; border-bottom: 2px solid transparent; color: #858988; background: transparent; font-size: 11px; font-weight: 600; }
@@ -121,6 +122,10 @@ button { cursor: pointer; }
 .cancel-button { border: 1px solid rgba(244, 119, 110, .35); color: #f59b94; background: rgba(244, 119, 110, .09); }
 .cancel-button:hover { background: rgba(244, 119, 110, .15); }
 .query-editor { width: 100%; min-height: 205px; display: block; resize: vertical; border: 0; outline: none; padding: 16px; color: #d8d7d1; background: #111314; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; line-height: 1.7; tab-size: 2; }
+.stale-query-banner { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 13px; border-top: 1px solid rgba(243, 165, 27, .25); color: #d0ae69; background: rgba(243, 165, 27, .08); font-size: 10px; line-height: 1.4; }
+.stale-query-banner strong { color: #e9c984; }
+.stale-query-banner button { flex: 0 0 auto; padding: 6px 8px; border: 1px solid #89672c; border-radius: 4px; color: #e8c477; background: rgba(243, 165, 27, .08); font-size: 10px; font-weight: 600; }
+.stale-query-banner button:hover { background: rgba(243, 165, 27, .16); }
 .draft-inspector { display: flex; justify-content: space-between; gap: 15px; padding: 10px 13px; border-top: 1px solid var(--line); background: rgba(104, 199, 123, .045); }
 .draft-summary { align-items: flex-start; gap: 8px; }
 .check-icon { width: 15px; height: 15px; display: grid; place-items: center; border-radius: 50%; color: #102414; background: var(--green); font-size: 10px; font-weight: 800; }

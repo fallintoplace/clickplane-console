@@ -11,6 +11,7 @@ The project is intentionally shaped around the Control Plane full-stack intervie
 - cancellation and streamed query events
 - PromQL/time-series exploration
 - authorization and failure-handling discussion points
+- query-aware fixture results that match the generated SQL or PromQL
 
 It is not affiliated with ClickHouse.
 
@@ -46,6 +47,15 @@ packages/shared   Shared query, service, schema, metric, and result types
 The first version uses deterministic local fixtures behind the API. SQL and PromQL are represented
 as separate query modes with a shared lifecycle. A real ClickHouse or Prometheus adapter can be
 added without changing the core console flow.
+
+The fixture executor derives its result shape from the submitted query, so an error query returns
+error columns and a latency query returns latency series. It is deliberately not a SQL parser.
+It is a deterministic seam for practicing the frontend and control-plane behavior before wiring a
+real backend.
+
+Completed queries remain reconnectable for five minutes, then are evicted from the in-memory job
+store. Edited queries are preserved when the selected service changes, but the console marks them
+stale and requires an explicit rebind before execution.
 
 ## Golden path
 

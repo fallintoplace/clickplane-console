@@ -29,6 +29,13 @@ const PROMQL_START = "sum by (service) (rate(http_requests_total[5m]))";
 
 type Notice = { tone: "info" | "success" | "error"; text: string };
 
+interface ActiveExecution {
+  id: string;
+  mode: QueryMode;
+  serviceId: string;
+  stream: EventSource;
+}
+
 async function readJson<T>(response: Response): Promise<T> {
   const body = (await response.json()) as T & { error?: string; details?: string[] };
   if (!response.ok) {
@@ -40,6 +47,7 @@ async function readJson<T>(response: Response): Promise<T> {
 function App() {
   const [services, setServices] = useState<Service[]>([]);
   const [selectedServiceId, setSelectedServiceId] = useState("");
+  const [queryServiceId, setQueryServiceId] = useState("");
   const [schema, setSchema] = useState<SchemaTable[]>([]);
   const [metrics, setMetrics] = useState<MetricDefinition[]>([]);
   const [history, setHistory] = useState<QueryHistoryItem[]>([]);
@@ -52,10 +60,14 @@ function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [notice, setNotice] = useState<Notice>({ tone: "info", text: "Ready for a query." });
   const streamRef = useRef<EventSource | null>(null);
+  const activeExecutionRef = useRef<ActiveExecution | null>(null);
   const pendingHistoryQueryRef = useRef<string | null>(null);
+  const pendingHistoryServiceRef = useRef<string | null>(null);
+  const serviceContextRequestRef = useRef(0);
 
   const selectedService = services.find((service) => service.id === selectedServiceId);
   const isQueryRunning = run?.state === "queued" || run?.state === "running";
+  const isQueryStale = Boolean(queryServiceId && selectedServiceId && queryServiceId !== selectedServiceId);
 
   useEffect(() => {
     void Promise.all([
@@ -64,39 +76,56 @@ function App() {
     ])
       .then(([serviceResponse, historyResponse]) => {
         setServices(serviceResponse.services);
-        setSelectedServiceId(serviceResponse.services[0]?.id ?? "");
+        const firstServiceId = serviceResponse.services[0]?.id ?? "";
+        setSelectedServiceId(firstServiceId);
+        setQueryServiceId(firstServiceId);
         setHistory(historyResponse.history);
       })
       .catch((error: unknown) => {
         setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not load the console." });
       });
 
-    return () => streamRef.current?.close();
+    return () => {
+      streamRef.current?.close();
+      streamRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
     if (!selectedServiceId) return;
+    const controller = new AbortController();
+    const requestId = ++serviceContextRequestRef.current;
+    const requestedServiceId = selectedServiceId;
+
     void Promise.all([
-      fetch(`/api/services/${selectedServiceId}/schema`).then((response) => readJson<{ tables: SchemaTable[] }>(response)),
-      fetch(`/api/services/${selectedServiceId}/metrics`).then((response) => readJson<{ metrics: MetricDefinition[] }>(response)),
+      fetch(`/api/services/${requestedServiceId}/schema`, { signal: controller.signal }).then((response) => readJson<{ tables: SchemaTable[] }>(response)),
+      fetch(`/api/services/${requestedServiceId}/metrics`, { signal: controller.signal }).then((response) => readJson<{ metrics: MetricDefinition[] }>(response)),
     ])
       .then(([schemaResponse, metricsResponse]) => {
+        if (controller.signal.aborted || requestId !== serviceContextRequestRef.current || requestedServiceId !== selectedServiceId) return;
         setSchema(schemaResponse.tables);
         setMetrics(metricsResponse.metrics);
       })
       .catch((error: unknown) => {
+        if (controller.signal.aborted || requestId !== serviceContextRequestRef.current) return;
         setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not load service context." });
       });
+
+    return () => controller.abort();
   }, [selectedServiceId]);
 
   useEffect(() => {
     const historyQuery = pendingHistoryQueryRef.current;
+    const historyServiceId = pendingHistoryServiceRef.current;
     pendingHistoryQueryRef.current = null;
+    pendingHistoryServiceRef.current = null;
     setQuery(historyQuery ?? (mode === "sql" ? SQL_START : PROMQL_START));
+    setQueryServiceId(historyServiceId ?? selectedServiceId);
     setDraft(null);
     setResult(null);
     setRun(null);
     setPrompt(mode === "sql" ? "Show me the biggest errors from the last hour" : "Show request errors by service");
+    void invalidateActiveExecution();
   }, [mode]);
 
   const contextCount = mode === "sql" ? schema.length : metrics.length;
@@ -105,8 +134,46 @@ function App() {
     return metrics.map((metric) => metric.name);
   }, [metrics, mode, schema]);
 
+  function ownsExecution(queryId: string): boolean {
+    return activeExecutionRef.current?.id === queryId;
+  }
+
+  function releaseExecution(queryId: string): void {
+    const active = activeExecutionRef.current;
+    if (!active || active.id !== queryId) return;
+    active.stream.close();
+    activeExecutionRef.current = null;
+    if (streamRef.current === active.stream) streamRef.current = null;
+  }
+
+  async function invalidateActiveExecution(): Promise<void> {
+    const active = activeExecutionRef.current;
+    activeExecutionRef.current = null;
+    streamRef.current?.close();
+    streamRef.current = null;
+    if (!active) return;
+
+    try {
+      await fetch(`/api/queries/${active.id}/cancel`, { method: "POST" });
+    } catch {
+      // The UI has already detached from this execution. Cancellation is best effort.
+    }
+  }
+
+  function selectService(serviceId: string): void {
+    if (serviceId === selectedServiceId) return;
+    void invalidateActiveExecution();
+    setSelectedServiceId(serviceId);
+    setRun(null);
+    setResult(null);
+    setNotice({ tone: "info", text: "Service changed. Review the query target before running." });
+  }
+
   async function generateQuery(): Promise<void> {
     if (!selectedServiceId || !prompt.trim()) return;
+    const requestServiceId = selectedServiceId;
+    const requestMode = mode;
+    await invalidateActiveExecution();
     setIsGenerating(true);
     setNotice({ tone: "info", text: "Resolving service context and drafting a query..." });
     try {
@@ -114,18 +181,19 @@ function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          mode,
-          serviceId: selectedServiceId,
+          mode: requestMode,
+          serviceId: requestServiceId,
           prompt,
           context: {
-            serviceId: selectedServiceId,
-            ...(mode === "sql" ? { tables: currentContext } : { metrics: currentContext }),
+            ...(requestMode === "sql" ? { tables: currentContext } : { metrics: currentContext }),
           },
         }),
       });
       const body = await readJson<{ draft: QueryDraft }>(response);
+      if (selectedServiceId !== requestServiceId || mode !== requestMode) return;
       setDraft(body.draft);
       setQuery(body.draft.query);
+      setQueryServiceId(requestServiceId);
       setResult(null);
       setRun(null);
       setNotice({ tone: "success", text: "Draft ready. Review it before running." });
@@ -136,78 +204,90 @@ function App() {
     }
   }
 
-  function closeStream(): void {
-    streamRef.current?.close();
-    streamRef.current = null;
-  }
-
   async function loadHistory(): Promise<void> {
     const response = await fetch("/api/query-history");
     const body = await readJson<{ history: QueryHistoryItem[] }>(response);
     setHistory(body.history);
   }
 
-  function subscribeToQuery(queryId: string): void {
-    closeStream();
-    const stream = new EventSource(`/api/queries/${queryId}/events`);
+  function subscribeToQuery(query: QueryRun): void {
+    streamRef.current?.close();
+    const stream = new EventSource(`/api/queries/${query.id}/events`);
+    activeExecutionRef.current = {
+      id: query.id,
+      mode: query.mode,
+      serviceId: query.serviceId,
+      stream,
+    };
     streamRef.current = stream;
 
     const handleStatus = (event: Event) => {
+      if (!ownsExecution(query.id)) return;
       const payload = JSON.parse((event as MessageEvent<string>).data) as Extract<QueryEvent, { type: "status" }>;
       setRun(payload.run);
-      setNotice({ tone: payload.run.state === "cancelled" ? "info" : "info", text: payload.message });
+      setNotice({ tone: "info", text: payload.message });
     };
 
     const handleData = (event: Event) => {
+      if (!ownsExecution(query.id)) return;
       const payload = JSON.parse((event as MessageEvent<string>).data) as Extract<QueryEvent, { type: "data" }>;
       setResult(payload.result);
     };
 
     const handleComplete = (event: Event) => {
+      if (!ownsExecution(query.id)) return;
       const payload = JSON.parse((event as MessageEvent<string>).data) as Extract<QueryEvent, { type: "complete" }>;
       setRun(payload.run);
-      setNotice({ tone: "success", text: payload.run.state === "success" ? "Query completed." : "Query finished." });
-      closeStream();
+      setNotice({ tone: payload.run.state === "success" ? "success" : "info", text: payload.run.state === "success" ? "Query completed." : "Query finished." });
+      releaseExecution(query.id);
       void loadHistory();
     };
 
-    const handleQueryError = (event: Event) => {
+    const handleExecutionError = (event: Event) => {
+      if (!ownsExecution(query.id)) return;
       const data = (event as MessageEvent<string>).data;
       if (!data) {
         setNotice({ tone: "error", text: "The query stream disconnected." });
         return;
       }
-      const payload = JSON.parse(data) as Extract<QueryEvent, { type: "error" }>;
+      const payload = JSON.parse(data) as Extract<QueryEvent, { type: "execution-error" }>;
       setRun(payload.run);
       setNotice({ tone: "error", text: payload.message });
-      closeStream();
+      releaseExecution(query.id);
       void loadHistory();
     };
 
     stream.addEventListener("status", handleStatus);
     stream.addEventListener("data", handleData);
     stream.addEventListener("complete", handleComplete);
-    stream.addEventListener("error", handleQueryError);
+    stream.addEventListener("execution-error", handleExecutionError);
     stream.onerror = () => {
-      if (stream.readyState === EventSource.CLOSED) {
-        setNotice({ tone: "error", text: "The query stream disconnected." });
-      }
+      if (!ownsExecution(query.id)) return;
+      setNotice({ tone: "error", text: "The query stream disconnected." });
+      releaseExecution(query.id);
     };
   }
 
   async function runQuery(): Promise<void> {
-    if (!selectedServiceId || !query.trim() || isQueryRunning) return;
+    if (!selectedServiceId || !query.trim() || isQueryRunning || isQueryStale) return;
+    const requestServiceId = selectedServiceId;
+    const requestMode = mode;
+    await invalidateActiveExecution();
     setNotice({ tone: "info", text: "Submitting query..." });
     setResult(null);
     try {
       const response = await fetch("/api/queries", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, serviceId: selectedServiceId, query }),
+        body: JSON.stringify({ mode: requestMode, serviceId: requestServiceId, query }),
       });
       const body = await readJson<{ run: QueryRun }>(response);
+      if (selectedServiceId !== requestServiceId || mode !== requestMode || isQueryStale) {
+        await fetch(`/api/queries/${body.run.id}/cancel`, { method: "POST" });
+        return;
+      }
       setRun(body.run);
-      subscribeToQuery(body.run.id);
+      subscribeToQuery(body.run);
     } catch (error: unknown) {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "Could not run the query." });
     }
@@ -220,10 +300,17 @@ function App() {
   }
 
   function selectHistoryItem(item: QueryHistoryItem): void {
-    setSelectedServiceId(item.serviceId);
-    pendingHistoryQueryRef.current = item.query;
-    setMode(item.mode);
-    if (item.mode === mode) setQuery(item.query);
+    selectService(item.serviceId);
+    if (item.mode === mode) {
+      pendingHistoryQueryRef.current = null;
+      pendingHistoryServiceRef.current = null;
+      setQuery(item.query);
+      setQueryServiceId(item.serviceId);
+    } else {
+      pendingHistoryQueryRef.current = item.query;
+      pendingHistoryServiceRef.current = item.serviceId;
+      setMode(item.mode);
+    }
     setResult(null);
     setDraft(null);
     setNotice({ tone: "info", text: "Loaded a query from history." });
@@ -260,7 +347,7 @@ function App() {
                 <button
                   className={`service-item ${service.id === selectedServiceId ? "selected" : ""}`}
                   key={service.id}
-                  onClick={() => setSelectedServiceId(service.id)}
+                  onClick={() => selectService(service.id)}
                 >
                   <span className={`status-dot ${service.status}`} />
                   <span className="service-item-copy">
@@ -356,11 +443,17 @@ function App() {
                 {isQueryRunning ? (
                   <button className="cancel-button" onClick={() => void cancelQuery()}>Cancel query</button>
                 ) : (
-                  <button className="run-button" onClick={() => void runQuery()} disabled={!selectedServiceId || !query.trim()}><span>▶</span> Run query</button>
+                  <button className="run-button" onClick={() => void runQuery()} disabled={!selectedServiceId || !query.trim() || isQueryStale}><span>▶</span> Run query</button>
                 )}
               </div>
             </div>
             <textarea className="query-editor" aria-label={`${mode} editor`} value={query} onChange={(event) => setQuery(event.target.value)} spellCheck={false} />
+            {isQueryStale && (
+              <div className="stale-query-banner">
+                <span><strong>Query target changed.</strong> This draft was created for {services.find((service) => service.id === queryServiceId)?.name ?? queryServiceId}, but the console is now on {selectedService?.name ?? selectedServiceId}.</span>
+                <button onClick={() => { setQueryServiceId(selectedServiceId); setDraft(null); setNotice({ tone: "info", text: "Query rebound to the current service. Review it before running." }); }}>Use current service</button>
+              </div>
+            )}
             {draft && (
               <div className="draft-inspector">
                 <div className="draft-summary"><span className="check-icon">✓</span><span><strong>Generated draft</strong><small>{draft.explanation}</small></span></div>
@@ -446,7 +539,7 @@ function PromqlResultView({ result }: { result: PromqlResult }) {
           <div className="series-row" key={series.labels.service}>
             <span className="series-color" />
             <code>{series.metric}{formatLabels(series.labels)}</code>
-            <span className="series-latest">{series.points.at(-1)?.value.toFixed(4)} /s</span>
+            <span className="series-latest">{formatSeriesValue(series.points.at(-1)?.value ?? 0, result.unit)}</span>
           </div>
         ))}
       </div>
@@ -498,6 +591,12 @@ function formatCell(value: string | number | boolean | null): string {
 
 function formatLabels(labels: Record<string, string>): string {
   return `{${Object.entries(labels).map(([key, value]) => `${key}="${value}"`).join(", ")}}`;
+}
+
+function formatSeriesValue(value: number, unit: PromqlResult["unit"]): string {
+  if (unit === "seconds") return `${(value * 1_000).toFixed(1)} ms`;
+  if (unit === "ratio") return value.toFixed(4);
+  return `${value.toFixed(3)} /s`;
 }
 
 export default App;

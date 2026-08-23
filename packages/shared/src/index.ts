@@ -33,7 +33,6 @@ export interface MetricDefinition {
 }
 
 export interface QueryContext {
-  serviceId: string;
   tables?: string[];
   metrics?: string[];
   savedQuery?: string;
@@ -94,6 +93,7 @@ export interface TimeSeries {
 
 export interface PromqlResult {
   mode: "promql";
+  unit: "per_second" | "seconds" | "ratio";
   series: TimeSeries[];
 }
 
@@ -103,7 +103,7 @@ export type QueryEvent =
   | { type: "status"; run: QueryRun; message: string }
   | { type: "data"; result: QueryResult }
   | { type: "complete"; run: QueryRun }
-  | { type: "error"; run: QueryRun; message: string };
+  | { type: "execution-error"; run: QueryRun; message: string };
 
 export interface QueryHistoryItem extends QueryRun {
   resultSummary?: string;
