@@ -2,7 +2,7 @@
   "name": "clickplane-console",
   "private": true,
   "version": "0.1.0",
-  "description": "An independent ClickHouse-inspired console for SQL, PromQL, and natural-language query workflows.",
+  "description": "AI-assisted ClickHouse console with live SQL, schema discovery, PromQL exploration, and real-time query workflows.",
   "workspaces": [
     "apps/*",
     "packages/*"
