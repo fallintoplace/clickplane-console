@@ -1,0 +1,24 @@
+{
+  "name": "clickplane-console",
+  "private": true,
+  "version": "0.1.0",
+  "description": "An independent ClickHouse-inspired console for SQL, PromQL, and natural-language query workflows.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n API,WEB -c yellow,cyan \"yarn workspace @clickplane/api dev\" \"yarn workspace @clickplane/web dev\"",
+    "build": "yarn workspace @clickplane/api typecheck && yarn workspace @clickplane/web build",
+    "test": "yarn workspace @clickplane/api test",
+    "typecheck": "yarn workspace @clickplane/api typecheck && yarn workspace @clickplane/web typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
