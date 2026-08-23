@@ -9,6 +9,8 @@
   ],
   "scripts": {
     "dev": "concurrently -k -n API,WEB -c yellow,cyan \"yarn workspace @clickplane/api dev\" \"yarn workspace @clickplane/web dev\"",
+    "clickhouse:up": "docker compose up -d",
+    "dev:clickhouse": "CLICKPLANE_EXECUTOR=clickhouse CLICKHOUSE_URL=http://localhost:8123 CLICKHOUSE_USERNAME=default CLICKHOUSE_PASSWORD=clickplane-local concurrently -k -n API,WEB -c yellow,cyan \"yarn workspace @clickplane/api dev\" \"yarn workspace @clickplane/web dev\"",
     "build": "yarn workspace @clickplane/api typecheck && yarn workspace @clickplane/web build",
     "test": "yarn workspace @clickplane/api test",
     "typecheck": "yarn workspace @clickplane/api typecheck && yarn workspace @clickplane/web typecheck"

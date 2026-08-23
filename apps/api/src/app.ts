@@ -5,22 +5,21 @@ import { z } from "zod";
 import type {
   GenerationRequest,
   MetricDefinition,
-  PromqlResult,
   QueryDraft,
   QueryEvent,
   QueryHistoryItem,
   QueryMode,
   QueryProgress,
   QueryRequest,
-  QueryResult,
   QueryRun,
   QueryRunState,
   SchemaTable,
   Service,
-  SqlResult,
-  TimeSeries,
 } from "@clickplane/shared";
 import { metrics, schemas, services } from "./fixtures.js";
+import { createQueryExecutor, type QueryExecutor } from "./query-executor.js";
+
+export { buildResult } from "./query-executor.js";
 
 const generationRequestSchema = z.object({
   mode: z.enum(["sql", "promql"]),
@@ -46,6 +45,7 @@ interface QueryJob {
   events: QueryEvent[];
   subscribers: Set<(event: QueryEvent) => void>;
   timers: NodeJS.Timeout[];
+  abortController?: AbortController;
   evictionTimer?: NodeJS.Timeout;
 }
 
@@ -65,8 +65,7 @@ function getMetrics(serviceId: string): MetricDefinition[] {
   return metrics[serviceId] ?? [];
 }
 
-function getSelectedTables(serviceId: string, requestedTables?: string[]): SchemaTable[] {
-  const availableTables = getSchema(serviceId);
+function getSelectedTables(serviceId: string, requestedTables?: string[], availableTables = getSchema(serviceId)): SchemaTable[] {
   if (!requestedTables?.length) return availableTables;
 
   const requested = new Set(requestedTables);
@@ -119,40 +118,44 @@ function validateQuery(mode: QueryMode, query: string): string[] {
   return errors;
 }
 
-function buildSqlDraft(prompt: string, serviceId: string, requestedTables?: string[]): QueryDraft {
+function buildSqlDraft(prompt: string, serviceId: string, requestedTables?: string[], availableTables = getSchema(serviceId)): QueryDraft {
   const normalized = prompt.toLowerCase();
-  const tables = getSelectedTables(serviceId, requestedTables);
-  const hasErrorsTable = tables.some((table) => table.name === "errors");
-  const hasOrdersTable = tables.some((table) => table.name === "orders");
+  const tables = getSelectedTables(serviceId, requestedTables, availableTables);
+  const errorsTable = tables.find((table) => table.name === "errors");
+  const ordersTable = tables.find((table) => table.name === "orders");
+  const requestTable = tables.find((table) => table.name === "http_requests") ?? tables[0];
+  const errorsReference = errorsTable ? `${errorsTable.database}.${errorsTable.name}` : "analytics.errors";
+  const ordersReference = ordersTable ? `${ordersTable.database}.${ordersTable.name}` : "commerce.orders";
+  const requestReference = requestTable ? `${requestTable.database}.${requestTable.name}` : "analytics.http_requests";
 
-  if (/revenue|order|customer/.test(normalized) && hasOrdersTable) {
+  if (/revenue|order|customer/.test(normalized) && ordersTable) {
     return {
       mode: "sql",
-      query: `SELECT\n  region,\n  sum(revenue) AS revenue\nFROM commerce.orders\nWHERE created_at >= now() - INTERVAL 1 DAY\nGROUP BY region\nORDER BY revenue DESC\nLIMIT 10`,
+      query: `SELECT\n  region,\n  sum(revenue) AS revenue\nFROM ${ordersReference}\nWHERE created_at >= now() - INTERVAL 1 DAY\nGROUP BY region\nORDER BY revenue DESC\nLIMIT 10`,
       explanation: "Aggregates yesterday's order revenue by region and returns the ten highest-revenue regions.",
-      assumptions: ["Revenue is stored in commerce.orders.revenue.", "Yesterday means the last 24 hours."],
-      referencedContext: ["commerce.orders", "created_at", "region", "revenue"],
+      assumptions: [`Revenue is stored in ${ordersReference}.revenue.`, "Yesterday means the last 24 hours."],
+      referencedContext: [ordersReference, "created_at", "region", "revenue"],
       warnings: ["Review the time window before running this query."],
     };
   }
 
-  if (/error|failure|failed|exception/.test(normalized) && hasErrorsTable) {
+  if (/error|failure|failed|exception/.test(normalized) && errorsTable) {
     return {
       mode: "sql",
-      query: `SELECT\n  service,\n  error_type,\n  count() AS errors\nFROM analytics.errors\nWHERE timestamp >= now() - INTERVAL 1 HOUR\nGROUP BY service, error_type\nORDER BY errors DESC\nLIMIT 20`,
+      query: `SELECT\n  service,\n  error_type,\n  count() AS errors\nFROM ${errorsReference}\nWHERE timestamp >= now() - INTERVAL 1 HOUR\nGROUP BY service, error_type\nORDER BY errors DESC\nLIMIT 20`,
       explanation: "Counts recent errors by service and error type so the largest failure sources are visible first.",
-      assumptions: ["The last hour is the intended analysis window.", "analytics.errors contains one row per observed error."],
-      referencedContext: ["analytics.errors", "timestamp", "service", "error_type"],
+      assumptions: ["The last hour is the intended analysis window.", `${errorsReference} contains one row per observed error.`],
+      referencedContext: [errorsReference, "timestamp", "service", "error_type"],
       warnings: ["The result is capped at 20 grouped rows."],
     };
   }
 
   return {
     mode: "sql",
-    query: `SELECT\n  service,\n  route,\n  count() AS requests,\n  avg(duration_ms) AS average_duration_ms\nFROM analytics.http_requests\nWHERE timestamp >= now() - INTERVAL 1 HOUR\nGROUP BY service, route\nORDER BY requests DESC\nLIMIT 100`,
+    query: `SELECT\n  service,\n  route,\n  count() AS requests,\n  avg(duration_ms) AS average_duration_ms\nFROM ${requestReference}\nWHERE timestamp >= now() - INTERVAL 1 HOUR\nGROUP BY service, route\nORDER BY requests DESC\nLIMIT 100`,
     explanation: "Summarizes recent request volume and average duration by service and route.",
-    assumptions: ["The last hour is the intended time window.", "analytics.http_requests is the request event table."],
-    referencedContext: ["analytics.http_requests", "timestamp", "service", "route", "duration_ms"],
+    assumptions: ["The last hour is the intended time window.", `${requestReference} is the request event table.`],
+    referencedContext: [requestReference, "timestamp", "service", "route", "duration_ms"],
     warnings: ["The result is capped at 100 grouped rows."],
   };
 }
@@ -194,95 +197,10 @@ function buildPromqlDraft(prompt: string, serviceId: string, requestedMetrics?: 
   };
 }
 
-function generateDraft(request: GenerationRequest): QueryDraft {
+function generateDraft(request: GenerationRequest, availableTables = getSchema(request.serviceId)): QueryDraft {
   return request.mode === "sql"
-    ? buildSqlDraft(request.prompt, request.serviceId, request.context?.tables)
+    ? buildSqlDraft(request.prompt, request.serviceId, request.context?.tables, availableTables)
     : buildPromqlDraft(request.prompt, request.serviceId, request.context?.metrics);
-}
-
-function buildRequestResult(): SqlResult {
-  return {
-    mode: "sql",
-    columns: ["service", "route", "requests", "average_duration_ms"],
-    rows: [
-      { service: "checkout-api", route: "/checkout", requests: 18420, average_duration_ms: 148.2 },
-      { service: "checkout-api", route: "/payment", requests: 11280, average_duration_ms: 231.7 },
-      { service: "catalog-api", route: "/products", requests: 9840, average_duration_ms: 87.4 },
-      { service: "identity-api", route: "/session", requests: 7540, average_duration_ms: 64.9 },
-    ],
-  };
-}
-
-function buildErrorsResult(): SqlResult {
-  return {
-    mode: "sql",
-    columns: ["service", "error_type", "errors"],
-    rows: [
-      { service: "checkout-api", error_type: "payment_timeout", errors: 184 },
-      { service: "identity-api", error_type: "invalid_session", errors: 96 },
-      { service: "catalog-api", error_type: "upstream_timeout", errors: 61 },
-    ],
-  };
-}
-
-function buildRevenueResult(): SqlResult {
-  return {
-    mode: "sql",
-    columns: ["region", "revenue"],
-    rows: [
-      { region: "DACH", revenue: 184_210.4 },
-      { region: "Nordics", revenue: 133_904.8 },
-      { region: "Benelux", revenue: 98_311.2 },
-    ],
-  };
-}
-
-function buildSqlResult(query: string): SqlResult {
-  const normalized = query.toLowerCase();
-  if (normalized.includes("analytics.errors") || /\berror_type\b/.test(normalized)) return buildErrorsResult();
-  if (normalized.includes("commerce.orders") || /\brevenue\b/.test(normalized)) return buildRevenueResult();
-  return buildRequestResult();
-}
-
-function buildPromqlResult(query: string): PromqlResult {
-  const now = Math.floor(Date.now() / 300_000) * 300;
-  const normalized = query.toLowerCase();
-  const isLatency = normalized.includes("histogram_quantile") || normalized.includes("duration_seconds_bucket");
-  const isErrors = normalized.includes("http_request_errors_total");
-  const metric = isLatency ? "http_request_duration_seconds" : isErrors ? "http_request_errors_total" : "http_requests_total";
-  const unit = isLatency ? "seconds" : "per_second";
-  const servicesToPlot = [
-    {
-      name: "checkout-api",
-      base: isLatency ? 0.19 : isErrors ? 0.028 : 14,
-      slope: isLatency ? 0.004 : isErrors ? 0.0018 : 0.45,
-    },
-    {
-      name: "catalog-api",
-      base: isLatency ? 0.11 : isErrors ? 0.012 : 9,
-      slope: isLatency ? 0.002 : isErrors ? 0.0009 : 0.22,
-    },
-    {
-      name: "identity-api",
-      base: isLatency ? 0.08 : isErrors ? 0.007 : 6,
-      slope: isLatency ? -0.001 : isErrors ? -0.0004 : -0.12,
-    },
-  ];
-
-  const series: TimeSeries[] = servicesToPlot.map(({ name, base, slope }) => ({
-    metric,
-    labels: { service: name },
-    points: Array.from({ length: 18 }, (_, index) => ({
-      timestamp: now - (17 - index) * 300,
-      value: Math.max(0.001, base + slope * index + Math.sin(index * 1.4) * base * 0.32),
-    })),
-  }));
-
-  return { mode: "promql", unit, series };
-}
-
-export function buildResult(mode: QueryMode, query: string): QueryResult {
-  return mode === "sql" ? buildSqlResult(query) : buildPromqlResult(query);
 }
 
 function emit(job: QueryJob, event: QueryEvent): void {
@@ -371,7 +289,57 @@ function finishJob(
   scheduleEviction(job);
 }
 
-function startJob(job: QueryJob): void {
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function executeJob(job: QueryJob, executor: QueryExecutor): Promise<void> {
+  if (isTerminal(job.run.state)) return;
+  const abortController = new AbortController();
+  job.abortController = abortController;
+  const executionPromise = executor.execute({
+    mode: job.run.mode,
+    serviceId: job.run.serviceId,
+    query: job.run.query,
+    queryId: job.run.id,
+    signal: abortController.signal,
+  });
+  void executionPromise.catch(() => undefined);
+
+  try {
+    await wait(400);
+    if (job.run.state !== "running") {
+      await executionPromise.catch(() => undefined);
+      return;
+    }
+    transitionJob(job, "running", "Streaming result rows", "streaming");
+
+    const execution = await executionPromise;
+    if (isTerminal(job.run.state)) return;
+    emit(job, { type: "data", result: execution.result });
+    finishJob(
+      job,
+      "success",
+      "Query completed",
+      job.run.mode === "sql" ? "Rows returned" : "Series returned",
+      undefined,
+      {
+        rowsScanned: execution.rowsScanned,
+        bytesRead: execution.bytesRead,
+        ...(execution.rowsReturned === undefined ? {} : { rowsReturned: execution.rowsReturned }),
+        ...(execution.seriesReturned === undefined ? {} : { seriesReturned: execution.seriesReturned }),
+      },
+    );
+  } catch (error: unknown) {
+    if (isTerminal(job.run.state) || abortController.signal.aborted) return;
+    const errorMessage = error instanceof Error ? error.message : "The query engine rejected this expression.";
+    finishJob(job, "error", "Query failed", "Query failed", errorMessage);
+  } finally {
+    if (job.abortController === abortController) job.abortController = undefined;
+  }
+}
+
+function startJob(job: QueryJob, executor: QueryExecutor): void {
   emit(job, { type: "status", run: job.run, message: "Queued for execution" });
 
   job.timers.push(
@@ -384,49 +352,15 @@ function startJob(job: QueryJob): void {
   job.timers.push(
     setTimeout(() => {
       if (job.run.state !== "running") return;
-      transitionJob(job, "running", "Executing on the selected service", "executing", job.run.mode === "sql"
-        ? { rowsScanned: 1_120_000, bytesRead: 22_400_000 }
-        : { rowsScanned: 0, bytesRead: 0 });
+      transitionJob(job, "running", "Executing on the selected service", "executing");
+      void executeJob(job, executor);
     }, 360),
-  );
-
-  job.timers.push(
-    setTimeout(() => {
-      if (job.run.state !== "running") return;
-      transitionJob(job, "running", "Streaming result rows", "streaming", job.run.mode === "sql"
-        ? { rowsScanned: 1_840_000, bytesRead: 38_200_000 }
-        : { rowsScanned: 0, bytesRead: 0 });
-    }, 760),
-  );
-
-  job.timers.push(
-    setTimeout(() => {
-      if (job.run.state !== "running") return;
-
-      if (/\bfail\b|\bsyntax_error\b/i.test(job.run.query)) {
-        const errorMessage = "The query engine rejected this expression.";
-        finishJob(job, "error", "Query failed", "Query failed", errorMessage);
-        return;
-      }
-
-      const result = buildResult(job.run.mode, job.run.query);
-      emit(job, { type: "data", result });
-      finishJob(
-        job,
-        "success",
-        "Query completed",
-        job.run.mode === "sql" ? "Rows returned" : "Series returned",
-        undefined,
-        result.mode === "sql"
-          ? { rowsScanned: 1_840_000, bytesRead: 38_200_000, rowsReturned: result.rows.length }
-          : { rowsScanned: 0, bytesRead: 0, seriesReturned: result.series.length },
-      );
-    },
-  1_050),
   );
 }
 
-function cancelJob(job: QueryJob): void {
+function cancelJob(job: QueryJob, executor: QueryExecutor): void {
+  job.abortController?.abort();
+  void executor.cancel(job.run.id);
   finishJob(job, "cancelled", "Query cancelled", "Cancelled by user");
 }
 
@@ -434,21 +368,28 @@ function sendSse(reply: FastifyReply, event: QueryEvent): void {
   reply.raw.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
 }
 
-export function buildApp(): FastifyInstance {
+export interface BuildAppOptions {
+  executor?: QueryExecutor;
+}
+
+export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const app = Fastify({ logger: false });
+  const executor = options.executor ?? createQueryExecutor();
 
   app.register(cors, { origin: true });
   app.addHook("onClose", async () => {
     for (const job of jobs.values()) {
       for (const timer of job.timers) clearTimeout(timer);
+      job.abortController?.abort();
       if (job.evictionTimer) clearTimeout(job.evictionTimer);
       job.subscribers.clear();
     }
     jobs.clear();
     history.splice(0);
+    await executor.close();
   });
 
-  app.get("/api/health", async () => ({ status: "ok", service: "clickplane-api" }));
+  app.get("/api/health", async () => ({ status: "ok", service: "clickplane-api", executor: executor.kind }));
 
   app.get("/api/services", async () => ({ services }));
 
@@ -456,14 +397,18 @@ export function buildApp(): FastifyInstance {
     if (!findService(request.params.serviceId)) {
       return reply.code(404).send({ error: "Service not found" });
     }
-    return { tables: getSchema(request.params.serviceId) };
+    try {
+      return { tables: await executor.getSchema(request.params.serviceId) };
+    } catch (error: unknown) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : "Could not load ClickHouse schema" });
+    }
   });
 
   app.get<{ Params: { serviceId: string } }>("/api/services/:serviceId/metrics", async (request, reply) => {
     if (!findService(request.params.serviceId)) {
       return reply.code(404).send({ error: "Service not found" });
     }
-    return { metrics: getMetrics(request.params.serviceId) };
+    return { metrics: executor.getMetrics(request.params.serviceId) };
   });
 
   app.post("/api/query-drafts", async (request, reply) => {
@@ -474,7 +419,12 @@ export function buildApp(): FastifyInstance {
     if (!findService(parsed.data.serviceId)) {
       return reply.code(404).send({ error: "Service not found" });
     }
-    return { draft: generateDraft(parsed.data) };
+    try {
+      const availableTables = parsed.data.mode === "sql" ? await executor.getSchema(parsed.data.serviceId) : undefined;
+      return { draft: generateDraft(parsed.data, availableTables ?? getSchema(parsed.data.serviceId)) };
+    } catch (error: unknown) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : "Could not load query context" });
+    }
   });
 
   app.post("/api/queries", async (request, reply) => {
@@ -501,7 +451,7 @@ export function buildApp(): FastifyInstance {
     };
     const job: QueryJob = { run, events: [], subscribers: new Set(), timers: [] };
     jobs.set(run.id, job);
-    startJob(job);
+    startJob(job, executor);
     return reply.code(202).send({ run });
   });
 
@@ -538,7 +488,7 @@ export function buildApp(): FastifyInstance {
     if (!job) {
       return reply.code(404).send({ error: "Query not found" });
     }
-    cancelJob(job);
+    cancelJob(job, executor);
     return { run: job.run };
   });
 

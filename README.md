@@ -1,8 +1,7 @@
 # ClickPlane Console
 
-An independent ClickHouse-inspired Cloud Console practice project.
-
-The project is intentionally shaped around the Control Plane full-stack interview surface:
+An experimental ClickHouse-inspired Cloud Console for AI-assisted analytics, service context,
+safe query execution, and real-time query workflows.
 
 - service and workspace context
 - a SQL-first query console
@@ -11,7 +10,6 @@ The project is intentionally shaped around the Control Plane full-stack intervie
 - cancellation and streamed query events
 - PromQL/time-series exploration
 - authorization and failure-handling discussion points
-- query-aware fixture results that match the generated SQL or PromQL
 
 It is not affiliated with ClickHouse.
 
@@ -28,6 +26,26 @@ Then open [http://localhost:5173](http://localhost:5173).
 
 The API runs at [http://localhost:3001](http://localhost:3001).
 
+The default mode uses deterministic fixtures, so the console works without external services.
+
+## Run against local ClickHouse
+
+Docker and Docker Compose are required for the local database.
+
+```bash
+yarn clickhouse:up
+yarn dev:clickhouse
+```
+
+Then open [http://localhost:5173](http://localhost:5173). The Compose seed creates request, error,
+and order tables under the `analytics` and `commerce` databases. The API discovers the live schema
+and sends SQL to ClickHouse with read-only settings, a 30-second execution limit, and a 500-row
+result limit.
+
+For ClickHouse Cloud or another endpoint, set `CLICKPLANE_EXECUTOR=clickhouse` together with
+`CLICKHOUSE_URL`, `CLICKHOUSE_USERNAME`, `CLICKHOUSE_PASSWORD`, and optionally
+`CLICKHOUSE_DATABASE` before starting the API.
+
 ## Verification
 
 ```bash
@@ -40,18 +58,18 @@ yarn build
 
 ```text
 apps/web          React console and query workspace
-apps/api          Node/Fastify control-plane API
+apps/api          Node/Fastify control-plane API and query executors
 packages/shared   Shared query, service, schema, metric, and result types
 ```
 
-The first version uses deterministic local fixtures behind the API. SQL and PromQL are represented
-as separate query modes with a shared lifecycle. A real ClickHouse or Prometheus adapter can be
-added without changing the core console flow.
+SQL and PromQL are represented as separate query modes with a shared lifecycle. The API has a
+fixture executor for offline demos and a ClickHouse executor behind the same interface. PromQL
+continues to use deterministic local results while the SQL path can run against a real ClickHouse
+endpoint.
 
 The fixture executor derives its result shape from the submitted query, so an error query returns
-error columns and a latency query returns latency series. It is deliberately not a SQL parser.
-It is a deterministic seam for practicing the frontend and control-plane behavior before wiring a
-real backend.
+error columns and a latency query returns latency series. It is deliberately not a SQL parser and
+remains useful for testing the frontend and control-plane behavior without a database.
 
 Completed queries remain reconnectable for five minutes, then are evicted from the in-memory job
 store. Edited queries are preserved when the selected service changes, but the console marks them

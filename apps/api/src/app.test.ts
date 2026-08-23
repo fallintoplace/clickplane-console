@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp, buildResult } from "./app.js";
+import { createQueryExecutor } from "./query-executor.js";
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -20,6 +21,15 @@ describe("ClickPlane API", () => {
 
     expect(response.statusCode).toBe(200);
     expect(response.json().services).toHaveLength(2);
+  });
+
+  it("keeps fixture mode as the safe default and validates real mode configuration", async () => {
+    const fixtureExecutor = createQueryExecutor({});
+    expect(fixtureExecutor.kind).toBe("fixture");
+    await fixtureExecutor.close();
+
+    expect(() => createQueryExecutor({ CLICKPLANE_EXECUTOR: "clickhouse" })).toThrow("CLICKHOUSE_URL is required");
+    expect(() => createQueryExecutor({ CLICKPLANE_EXECUTOR: "unknown" })).toThrow("Unsupported CLICKPLANE_EXECUTOR");
   });
 
   it("generates a reviewable SQL draft from natural language", async () => {
