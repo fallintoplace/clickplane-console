@@ -163,5 +163,30 @@ describe("ClickPlane API", () => {
     expect(eventsResponse.body).toContain("event: execution-error");
     expect(eventsResponse.body).toContain("finishedAt");
     expect(eventsResponse.body).toContain("event: complete");
+    expect(eventsResponse.body).toContain('"stage":"complete"');
+  });
+
+  it("reports query stages and result telemetry", async () => {
+    app = buildApp();
+    const createResponse = await app.inject({
+      method: "POST",
+      url: "/api/queries",
+      payload: {
+        mode: "sql",
+        serviceId: "checkout-eu",
+        query: "SELECT error_type, count() AS errors FROM analytics.errors GROUP BY error_type",
+      },
+    });
+    const run = createResponse.json().run;
+
+    expect(run.progress).toMatchObject({ stage: "queued", rowsScanned: 0, bytesRead: 0 });
+    await wait(1_250);
+
+    const eventsResponse = await app.inject({ method: "GET", url: `/api/queries/${run.id}/events` });
+    expect(eventsResponse.body).toContain('"stage":"planning"');
+    expect(eventsResponse.body).toContain('"stage":"executing"');
+    expect(eventsResponse.body).toContain('"stage":"streaming"');
+    expect(eventsResponse.body).toContain('"rowsReturned":3');
+    expect(eventsResponse.body).toContain('"bytesRead":38200000');
   });
 });

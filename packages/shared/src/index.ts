@@ -2,6 +2,15 @@ export type QueryMode = "sql" | "promql";
 
 export type ServiceStatus = "healthy" | "degraded" | "provisioning";
 
+export interface ServiceIncident {
+  id: string;
+  severity: "info" | "warning" | "critical";
+  title: string;
+  changePercent: number;
+  windowMinutes: number;
+  startedMinutesAgo: number;
+}
+
 export interface Service {
   id: string;
   name: string;
@@ -10,6 +19,7 @@ export interface Service {
   version: string;
   databases: number;
   metrics: number;
+  incident?: ServiceIncident;
 }
 
 export interface SchemaColumn {
@@ -62,6 +72,17 @@ export interface QueryRequest {
 
 export type QueryRunState = "queued" | "running" | "success" | "error" | "cancelled";
 
+export type QueryStage = "queued" | "planning" | "executing" | "streaming" | "complete";
+
+export interface QueryProgress {
+  stage: QueryStage;
+  elapsedMs: number;
+  rowsScanned: number;
+  bytesRead: number;
+  rowsReturned?: number;
+  seriesReturned?: number;
+}
+
 export interface QueryRun {
   id: string;
   mode: QueryMode;
@@ -72,6 +93,7 @@ export interface QueryRun {
   finishedAt?: string;
   durationMs?: number;
   error?: string;
+  progress?: QueryProgress;
 }
 
 export interface SqlResult {

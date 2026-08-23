@@ -10,6 +10,7 @@ import type {
   QueryEvent,
   QueryHistoryItem,
   QueryMode,
+  QueryProgress,
   QueryRequest,
   QueryResult,
   QueryRun,
@@ -299,11 +300,30 @@ function isTerminal(state: QueryRunState): boolean {
   return state === "success" || state === "error" || state === "cancelled";
 }
 
-function transitionJob(job: QueryJob, state: QueryRunState, message: string): void {
+function progressForStage(stage: QueryProgress["stage"], startedAt: string, details: Partial<QueryProgress> = {}): QueryProgress {
+  return {
+    stage,
+    elapsedMs: Math.max(0, Date.now() - Date.parse(startedAt)),
+    rowsScanned: details.rowsScanned ?? 0,
+    bytesRead: details.bytesRead ?? 0,
+    ...(details.rowsReturned === undefined ? {} : { rowsReturned: details.rowsReturned }),
+    ...(details.seriesReturned === undefined ? {} : { seriesReturned: details.seriesReturned }),
+  };
+}
+
+function transitionJob(
+  job: QueryJob,
+  state: QueryRunState,
+  message: string,
+  stage: QueryProgress["stage"],
+  details: Partial<QueryProgress> = {},
+): void {
+  const startedAt = state === "running" && job.run.state === "queued" ? new Date().toISOString() : job.run.startedAt;
   job.run = {
     ...job.run,
     state,
-    ...(state === "running" ? { startedAt: new Date().toISOString() } : {}),
+    startedAt,
+    progress: progressForStage(stage, startedAt, { ...job.run.progress, ...details }),
   };
   emit(job, { type: "status", run: job.run, message });
 }
@@ -316,7 +336,14 @@ function scheduleEviction(job: QueryJob): void {
   job.evictionTimer = timer;
 }
 
-function finishJob(job: QueryJob, state: "success" | "error" | "cancelled", message: string, resultSummary: string, error?: string): void {
+function finishJob(
+  job: QueryJob,
+  state: "success" | "error" | "cancelled",
+  message: string,
+  resultSummary: string,
+  error?: string,
+  resultDetails: Partial<QueryProgress> = {},
+): void {
   if (isTerminal(job.run.state)) return;
 
   for (const timer of job.timers) clearTimeout(timer);
@@ -328,6 +355,11 @@ function finishJob(job: QueryJob, state: "success" | "error" | "cancelled", mess
     state,
     finishedAt,
     durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(job.run.startedAt)),
+    progress: progressForStage("complete", job.run.startedAt, {
+      ...job.run.progress,
+      ...resultDetails,
+      elapsedMs: Math.max(0, Date.parse(finishedAt) - Date.parse(job.run.startedAt)),
+    }),
     ...(error ? { error } : {}),
   };
   emit(job, { type: "status", run: job.run, message });
@@ -345,8 +377,26 @@ function startJob(job: QueryJob): void {
   job.timers.push(
     setTimeout(() => {
       if (job.run.state !== "queued") return;
-      transitionJob(job, "running", "Query is running");
+      transitionJob(job, "running", "Planning query", "planning");
     }, 160),
+  );
+
+  job.timers.push(
+    setTimeout(() => {
+      if (job.run.state !== "running") return;
+      transitionJob(job, "running", "Executing on the selected service", "executing", job.run.mode === "sql"
+        ? { rowsScanned: 1_120_000, bytesRead: 22_400_000 }
+        : { rowsScanned: 0, bytesRead: 0 });
+    }, 360),
+  );
+
+  job.timers.push(
+    setTimeout(() => {
+      if (job.run.state !== "running") return;
+      transitionJob(job, "running", "Streaming result rows", "streaming", job.run.mode === "sql"
+        ? { rowsScanned: 1_840_000, bytesRead: 38_200_000 }
+        : { rowsScanned: 0, bytesRead: 0 });
+    }, 760),
   );
 
   job.timers.push(
@@ -361,7 +411,16 @@ function startJob(job: QueryJob): void {
 
       const result = buildResult(job.run.mode, job.run.query);
       emit(job, { type: "data", result });
-      finishJob(job, "success", "Query completed", job.run.mode === "sql" ? "Rows returned" : "Series returned");
+      finishJob(
+        job,
+        "success",
+        "Query completed",
+        job.run.mode === "sql" ? "Rows returned" : "Series returned",
+        undefined,
+        result.mode === "sql"
+          ? { rowsScanned: 1_840_000, bytesRead: 38_200_000, rowsReturned: result.rows.length }
+          : { rowsScanned: 0, bytesRead: 0, seriesReturned: result.series.length },
+      );
     },
   1_050),
   );
@@ -438,6 +497,7 @@ export function buildApp(): FastifyInstance {
       query: parsed.data.query,
       state: "queued",
       startedAt: new Date().toISOString(),
+      progress: { stage: "queued", elapsedMs: 0, rowsScanned: 0, bytesRead: 0 },
     };
     const job: QueryJob = { run, events: [], subscribers: new Set(), timers: [] };
     jobs.set(run.id, job);
